@@ -1,6 +1,8 @@
-# bot.py — Telegram-бот с быстрым перезапуском диалога и webhook/polling-режимом
+# bot.py — Telegram-бот: упаковка токенов + форматирование текста (/format)
 import os
 import logging
+from pathlib import Path
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,17 +12,20 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from token_packer import pack, normalize_tokens
+from text_formatter import process_text  # новый модуль
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Состояния диалога
+# Состояния для "упаковщика"
 LEFT, RIGHT, MINLEN, MAXLEN, SEPARATOR = range(5)
+# Состояния для форматтера
+FMT_TEXT, FMT_N = range(5, 7)
 
 
 def _auto_wrap_separator(sep: str) -> str:
-    """Если пользователь не добавил скобки — обернём автоматически."""
     s = (sep or "").strip()
     if not s:
         return ") * ("
@@ -29,10 +34,10 @@ def _auto_wrap_separator(sep: str) -> str:
     return s
 
 
-# ======== Хэндлеры состояний ========
+# ======== УПАКОВЩИК (старый диалог) ========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт или перезапуск диалога."""
+    """Старт/перезапуск упаковщика."""
     context.user_data.clear()
     await update.message.reply_text(
         "Привет! Давай соберём токены.\nВведи ЛЕВУЮ часть (фиксированный список слов):"
@@ -78,7 +83,7 @@ async def maxlen_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("min_len не может быть больше max_len. Введите max_len ещё раз:")
         return MAXLEN
     await update.message.reply_text(
-        "Теперь введи разделитель (например ')*(' или ')/1(' — обязательно пишем скобочки):"
+        "Теперь введи разделитель (например ')*(' или ')/1(' — скобочки можно не писать):"
     )
     return SEPARATOR
 
@@ -92,7 +97,7 @@ async def separator_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = pack(ud["left"], ud["right"], ud["min_len"], ud["max_len"], separator)
         out_text = ", ".join(results)
 
-        if len(out_text) > 4000:  # запас до 4096
+        if len(out_text) > 4000:
             path = f"result_{update.effective_user.id}.txt"
             with open(path, "w", encoding="utf-8") as f:
                 f.write(out_text)
@@ -112,74 +117,62 @@ async def separator_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("⛔ Операция отменена.")
-    return ConversationHandler.END
+# ======== ФОРМАТТЕР ТЕКСТА (/format) ========
 
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сброс из любой точки: очищаем состояние и возвращаемся на шаг LEFT."""
-    context.user_data.clear()
-    await update.message.reply_text("🔁 Сбросил текущую сессию. Начнём заново.\nВведи ЛЕВУЮ часть:")
-    return LEFT
-
-
-# Глобальный обработчик ошибок, чтобы видеть стек-трейс в логах Render
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled exception", exc_info=context.error)
-
-
-def build_app() -> Application:
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("BOT_TOKEN is not set")
-
-    app = Application.builder().token(token).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            LEFT: [MessageHandler(filters.TEXT & ~filters.COMMAND, left_input)],
-            RIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, right_input)],
-            MINLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, minlen_input)],
-            MAXLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, maxlen_input)],
-            SEPARATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, separator_input)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("reset", reset),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
-        conversation_timeout=600,  # автозавершение диалога через 10 минут простоя
+async def format_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старт форматтера: ждём .txt или просто текст."""
+    # не очищаем весь user_data, чтобы не мешать параллельным сессиям упаковщика
+    context.user_data.pop("fmt_text", None)
+    await update.message.reply_text(
+        "Режим форматирования.\nПришлите .txt файл ИЛИ вставьте текст сообщением (через запятую):"
     )
-
-    # Добавим /reset глобально, чтобы он работал и вне диалога
-    app.add_handler(CommandHandler("reset", start))
-    app.add_handler(conv)
-    app.add_error_handler(on_error)
-    return app
+    return FMT_TEXT
 
 
-def main():
-    app = build_app()
-    # На Render есть RENDER_EXTERNAL_URL и PORT — используем webhook.
-    # Локально/без URL — fallback на polling.
-    base = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
-    port = int(os.getenv("PORT", "10000"))
-    path = f"/webhook/{os.getenv('WEBHOOK_PATH', 'tg')}"
+async def fmt_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимаем .txt или текст, сохраняем в user_data['fmt_text'] и спрашиваем N."""
+    text: str | None = None
 
-    if base:
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=path,
-            webhook_url=base.rstrip("/") + path,
-        )
-    else:
-        app.run_polling()
+    # Если прислали документ .txt
+    if update.message.document and update.message.document.mime_type == "text/plain":
+        doc = update.message.document
+        # Ограничение размера на всякий случай (например, 5 МБ)
+        if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+            await update.message.reply_text("Файл слишком большой (>5 МБ). Пришлите меньший файл.")
+            return FMT_TEXT
+        tgfile = await doc.get_file()
+        tmp_path = Path(f"upload_{update.effective_user.id}.txt")
+        await tgfile.download_to_drive(custom_path=str(tmp_path))
+        try:
+            text = tmp_path.read_text(encoding="utf-8")
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # Если прислали просто текст
+    elif update.message.text:
+        text = update.message.text
+
+    if not text or not text.strip():
+        await update.message.reply_text("Пустой ввод. Пришлите .txt или вставьте текст сообщением:")
+        return FMT_TEXT
+
+    context.user_data["fmt_text"] = text.strip()
+    await update.message.reply_text("Введите целое число N для тильды (по умолчанию 0):")
+    return FMT_N
 
 
-if __name__ == "__main__":
-    main()
+async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Парсим N, форматируем, отправляем файл и статистику."""
+    n_str = (update.message.text or "").strip()
+    try:
+        n = int(n_str) if n_str else 0
+    except ValueError:
+        await update.message.reply_text("Ошибка! Введите целое число N (например 0, 1, 2):")
+        return FMT_N
+
+    text = context.user_data.get("fmt_text", "")
+    try:
+        result, t
