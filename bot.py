@@ -175,4 +175,127 @@ async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = context.user_data.get("fmt_text", "")
     try:
-        result, t
+        result, total, phrases, singles = process_text(text, n)
+
+        # сохраняем во временный файл и отправляем
+        out_path = Path(f"formatted_{update.effective_user.id}.txt")
+        out_path.write_text(result, encoding="utf-8")
+        try:
+            with open(out_path, "rb") as f:
+                await update.message.reply_document(document=f, filename=out_path.name)
+        finally:
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # статистика
+        preview = result[:200]
+        await update.message.reply_text(
+            f"Готово ✅\nВсего элементов: {total}\nФраз: {phrases}\nОдиночных слов: {singles}\nПредпросмотр: {preview}"
+        )
+
+    except Exception as e:
+        logger.exception("Ошибка при форматировании")
+        await update.message.reply_text(f"Ошибка: {e}")
+
+    # завершаем диалог форматтера
+    context.user_data.pop("fmt_text", None)
+    return ConversationHandler.END
+
+
+# ======== Общие команды ========
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("⛔ Операция отменена.")
+    return ConversationHandler.END
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("🔁 Сбросил текущую сессию. Начнём заново.\nВведи ЛЕВУЮ часть:")
+    return LEFT
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+
+def build_app() -> Application:
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN is not set")
+
+    app = Application.builder().token(token).build()
+
+    # Диалог "упаковщика"
+    conv_pack = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            LEFT: [MessageHandler(filters.TEXT & ~filters.COMMAND, left_input)],
+            RIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, right_input)],
+            MINLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, minlen_input)],
+            MAXLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, maxlen_input)],
+            SEPARATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, separator_input)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("reset", reset),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+        conversation_timeout=600,
+        name="conv_pack",
+        persistent=False,
+    )
+
+    # Диалог "форматтера"
+    conv_fmt = ConversationHandler(
+        entry_points=[CommandHandler("format", format_start)],
+        states={
+            FMT_TEXT: [
+                # принимаем .txt файл или обычный текст
+                MessageHandler(filters.Document.FileExtension("txt"), fmt_text_input),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_text_input),
+            ],
+            FMT_N: [MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_n_input)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("reset", reset),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+        conversation_timeout=600,
+        name="conv_fmt",
+        persistent=False,
+    )
+
+    # Глобальные команды
+    app.add_handler(CommandHandler("reset", start))
+    app.add_handler(conv_fmt)
+    app.add_handler(conv_pack)
+
+    app.add_error_handler(on_error)
+    return app
+
+
+def main():
+    app = build_app()
+    base = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    port = int(os.getenv("PORT", "10000"))
+    path = f"/webhook/{os.getenv('WEBHOOK_PATH', 'tg')}"
+    if base:
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=path,
+            webhook_url=base.rstrip("/") + path,
+        )
+    else:
+        app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
