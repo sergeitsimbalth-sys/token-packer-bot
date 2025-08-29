@@ -83,7 +83,7 @@ async def maxlen_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("min_len не может быть больше max_len. Введите max_len ещё раз:")
         return MAXLEN
     await update.message.reply_text(
-        "Теперь введи разделитель (например ')*(' или ')/1(' — скобочки можно не писать):"
+        "Теперь введи разделитель (например ')*(' или ')/1(' — обязательно прописываем скобочки):"
     )
     return SEPARATOR
 
