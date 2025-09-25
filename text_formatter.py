@@ -25,7 +25,12 @@ def transform_item(item: str, n: int) -> str | None:
         s = s[1:-1].strip()
 
     # Убираем завершающую пунктуацию (. ! ? ; : …)
-    s = re.sub(r"""[\.!\?;:…]+$""", "", s, flags=re.VERBOSE)
+    s = re.sub(
+        r"""[\.!\?;:…]+$""",
+        "",
+        s,
+        flags=re.VERBOSE,
+    )
 
     # Заменяем дефисы, тире и подчеркивания на пробел
     s = re.sub(r"[-–—_]", " ", s)
