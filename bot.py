@@ -1,9 +1,9 @@
-# bot.py — Telegram-бот: упаковка токенов + форматирование текста
+# bot.py — Telegram-бот: меню /start, группировка на /gpupirovka, форматирование на /format, перезапуск /reset
 import os
 import logging
 from pathlib import Path
 
-from telegram import Update, BotCommand
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,19 +14,29 @@ from telegram.ext import (
 )
 
 from token_packer import pack, normalize_tokens
-from text_formatter import process_text
+from text_formatter import process_text  # форматирование текста
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Состояния диалога "упаковщика"
+# Состояния для "упаковщика" (группировки)
 LEFT, RIGHT, MINLEN, MAXLEN, SEPARATOR = range(5)
-# Состояния диалога "форматтера"
+# Состояния для форматтера
 FMT_TEXT, FMT_N = range(5, 7)
 
 
+def _kb_main():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("/gpupirovka"), KeyboardButton("/format")],
+            [KeyboardButton("/reset")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 def _auto_wrap_separator(sep: str) -> str:
-    """Если пользователь не добавил скобки — обернём автоматически."""
     s = (sep or "").strip()
     if not s:
         return ") * ("
@@ -35,24 +45,39 @@ def _auto_wrap_separator(sep: str) -> str:
     return s
 
 
-# ======== УПАКОВЩИК (группировка) ========
+# ========================== ГЛАВНОЕ МЕНЮ (/start) ==========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт/перезапуск группировки + краткая справка."""
+    """
+    Показывает подсказку и клавиатуру.
+    Не запускает диалог — только меню.
+    """
     context.user_data.clear()
-    help_text = (
-        "🧩 Что умеет бот:\n"
-        "• Группировка (упаковка токенов) — команда /start\n"
-        "  — Введите ЛЕВУЮ часть (фиксированный список слов), затем ПРАВУЮ (плавающий список),\n"
-        "    затем min_len, max_len и разделитель (например ')*('). Бот вернёт конструкции и их длины.\n\n"
-        "• Форматирование текста — команда /format\n"
-        "  — Пришлите .txt или вставьте текст через запятую, затем число N.\n"
-        '    Фразы (2+ слова) будут преобразованы в "фразу"~N, дефисы/подчёркивания очищаются.\n\n'
-        "Сервисные: /reset — сброс и перезапуск, /cancel — отмена, /help — подсказка.\n\n"
-        "Ок! Теперь начнём группировку.\n"
-        "Введи ЛЕВУЮ часть (фиксированный список слов):"
+    txt = (
+        "👋 Привет! Это бот с двумя функциями:\n\n"
+        "• /gpupirovka — ГРУППИРОВКА.\n"
+        "  Собирает выражения вида (ЛЕВАЯ_ЧАСТЬ)sep(ПРАВАЯ_ЧАСТЬ)\n"
+        "  с соблюдением ограничений длины: min_len ≤ длина ≤ max_len.\n"
+        "  Шаги: введёте левый список, правый список, min_len, max_len и разделитель (например `)*(`).\n\n"
+        "• /format — ФОРМАТИРОВАНИЕ текста.\n"
+        "  Чистит список через запятую: удаляет лишние кавычки/пунктуацию,\n"
+        "  заменяет дефисы/подчёркивания на пробелы, схлопывает пробелы.\n"
+        "  Все элементы из ≥2 слов оборачивает в кавычки и дописывает ~N (например: \"судный день\"~0).\n\n"
+        "В любой момент можно нажать /reset, чтобы перезапустить бота и вернуться в это меню."
     )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(txt, reply_markup=_kb_main())
+    return ConversationHandler.END
+
+
+# ========================== УПАКОВЩИК (ГРУППИРОВКА) ==========================
+
+async def gpupirovka_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старт диалога группировки: просим ЛЕВУЮ часть."""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Режим ГРУППИРОВКИ.\nВведи ЛЕВУЮ часть (фиксированный список слов):",
+        reply_markup=_kb_main(),
+    )
     return LEFT
 
 
@@ -108,7 +133,7 @@ async def separator_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = pack(ud["left"], ud["right"], ud["min_len"], ud["max_len"], separator)
         out_text = ", ".join(results)
 
-        if len(out_text) > 4000:  # запас до 4096 лимита сообщения
+        if len(out_text) > 4000:
             path = f"result_{update.effective_user.id}.txt"
             with open(path, "w", encoding="utf-8") as f:
                 f.write(out_text)
@@ -128,19 +153,20 @@ async def separator_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ======== ФОРМАТТЕР (/format) ========
+# ========================== ФОРМАТТЕР ТЕКСТА (/format) ==========================
 
 async def format_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Старт форматтера: ждём .txt или просто текст."""
     context.user_data.pop("fmt_text", None)
     await update.message.reply_text(
-        "Режим форматирования.\nПришлите .txt файл ИЛИ вставьте текст сообщением (через запятую):"
+        "Режим ФОРМАТИРОВАНИЯ.\nПришлите .txt файл ИЛИ вставьте текст сообщением (через запятую):",
+        reply_markup=_kb_main(),
     )
     return FMT_TEXT
 
 
 async def fmt_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимаем .txt или текст, сохраняем и спрашиваем число N."""
+    """Принимаем .txt или текст, сохраняем в user_data['fmt_text'] и спрашиваем N."""
     text: str | None = None
 
     if update.message.document and update.message.document.mime_type == "text/plain":
@@ -158,7 +184,6 @@ async def fmt_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
-
     elif update.message.text:
         text = update.message.text
 
@@ -183,7 +208,6 @@ async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = context.user_data.get("fmt_text", "")
     try:
         result, total, phrases, singles = process_text(text, n)
-
         out_path = Path(f"formatted_{update.effective_user.id}.txt")
         out_path.write_text(result, encoding="utf-8")
         try:
@@ -208,7 +232,7 @@ async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ======== Сервисные и справка ========
+# ========================== ОБЩЕЕ ==========================
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -217,36 +241,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перезапуск бота: очистка состояния и возврат в меню."""
     context.user_data.clear()
-    await update.message.reply_text("🔁 Сбросил текущую сессию. Начнём заново.\nВведи ЛЕВУЮ часть:")
-    return LEFT
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🧩 Справка:\n"
-        "• Группировка — /start\n"
-        "  1) ЛЕВАЯ часть → 2) ПРАВАЯ часть → 3) min_len → 4) max_len → 5) разделитель ('*(' и т.п.)\n"
-        "• Форматирование — /format\n"
-        "  — Пришлите .txt или текст через запятую, затем N. Фразы → \"...\"~N\n"
-        "• Сервисные: /reset — сброс и перезапуск, /cancel — отмена, /help — подсказка\n"
-    )
-    await update.message.reply_text(help_text)
+    await start(update, context)  # показать меню
+    return ConversationHandler.END
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception", exc_info=context.error)
-
-
-async def post_init(app: Application):
-    """Меню команд в Telegram-клиенте."""
-    await app.bot.set_my_commands([
-        BotCommand("start", "Группировка (упаковка токенов)"),
-        BotCommand("format", "Форматирование текста в \"...\"~N"),
-        BotCommand("reset", "Сброс диалога/перезапуск"),
-        BotCommand("cancel", "Отмена текущей операции"),
-        BotCommand("help", "Показать краткую справку"),
-    ])
 
 
 def build_app() -> Application:
@@ -254,9 +256,30 @@ def build_app() -> Application:
     if not token:
         raise RuntimeError("BOT_TOKEN is not set")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = Application.builder().token(token).build()
 
-    # Диалог "форматтера"
+    # Диалог группировки: старт на /gpupirovka
+    conv_pack = ConversationHandler(
+        entry_points=[CommandHandler("gpupirovka", gpupirovka_start)],
+        states={
+            LEFT: [MessageHandler(filters.TEXT & ~filters.COMMAND, left_input)],
+            RIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, right_input)],
+            MINLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, minlen_input)],
+            MAXLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, maxlen_input)],
+            SEPARATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, separator_input)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("reset", reset),
+            CommandHandler("start", start),
+        ],
+        allow_reentry=True,
+        conversation_timeout=600,
+        name="conv_pack",
+        persistent=False,
+    )
+
+    # Диалог форматтера: старт на /format
     conv_fmt = ConversationHandler(
         entry_points=[CommandHandler("format", format_start)],
         states={
@@ -266,37 +289,20 @@ def build_app() -> Application:
             ],
             FMT_N: [MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_n_input)],
         },
-        fallbacks=[CommandHandler("cancel", cancel),
-                   CommandHandler("reset", reset),
-                   CommandHandler("start", start)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("reset", reset),
+            CommandHandler("start", start),
+        ],
         allow_reentry=True,
         conversation_timeout=600,
         name="conv_fmt",
         persistent=False,
     )
 
-    # Диалог "упаковщика"
-    conv_pack = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            LEFT: [MessageHandler(filters.TEXT & ~filters.COMMAND, left_input)],
-            RIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, right_input)],
-            MINLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, minlen_input)],
-            MAXLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, maxlen_input)],
-            SEPARATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, separator_input)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel),
-                   CommandHandler("reset", reset),
-                   CommandHandler("start", start)],
-        allow_reentry=True,
-        conversation_timeout=600,
-        name="conv_pack",
-        persistent=False,
-    )
-
-    # Глобальные команды
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("reset", start))
+    # Глобальные команды: старт-меню и перезапуск
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(conv_fmt)
     app.add_handler(conv_pack)
 
@@ -306,7 +312,6 @@ def build_app() -> Application:
 
 def main():
     app = build_app()
-    # Webhook на Render (или любой PaaS) / Polling локально
     base = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
     port = int(os.getenv("PORT", "10000"))
     path = f"/webhook/{os.getenv('WEBHOOK_PATH', 'tg')}"
