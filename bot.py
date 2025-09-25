@@ -1,9 +1,9 @@
-# bot.py — Telegram-бот: упаковка токенов + форматирование текста (/format)
+# bot.py — Telegram-бот: упаковка токенов + форматирование текста
 import os
 import logging
 from pathlib import Path
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,18 +14,19 @@ from telegram.ext import (
 )
 
 from token_packer import pack, normalize_tokens
-from text_formatter import process_text  # новый модуль
+from text_formatter import process_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Состояния для "упаковщика"
+# Состояния диалога "упаковщика"
 LEFT, RIGHT, MINLEN, MAXLEN, SEPARATOR = range(5)
-# Состояния для форматтера
+# Состояния диалога "форматтера"
 FMT_TEXT, FMT_N = range(5, 7)
 
 
 def _auto_wrap_separator(sep: str) -> str:
+    """Если пользователь не добавил скобки — обернём автоматически."""
     s = (sep or "").strip()
     if not s:
         return ") * ("
@@ -34,14 +35,24 @@ def _auto_wrap_separator(sep: str) -> str:
     return s
 
 
-# ======== УПАКОВЩИК (старый диалог) ========
+# ======== УПАКОВЩИК (группировка) ========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт/перезапуск упаковщика."""
+    """Старт/перезапуск группировки + краткая справка."""
     context.user_data.clear()
-    await update.message.reply_text(
-        "Привет! Давай соберём токены.\nВведи ЛЕВУЮ часть (фиксированный список слов):"
+    help_text = (
+        "🧩 Что умеет бот:\n"
+        "• Группировка (упаковка токенов) — команда /start\n"
+        "  — Введите ЛЕВУЮ часть (фиксированный список слов), затем ПРАВУЮ (плавающий список),\n"
+        "    затем min_len, max_len и разделитель (например ')*('). Бот вернёт конструкции и их длины.\n\n"
+        "• Форматирование текста — команда /format\n"
+        "  — Пришлите .txt или вставьте текст через запятую, затем число N.\n"
+        '    Фразы (2+ слова) будут преобразованы в "фразу"~N, дефисы/подчёркивания очищаются.\n\n'
+        "Сервисные: /reset — сброс и перезапуск, /cancel — отмена, /help — подсказка.\n\n"
+        "Ок! Теперь начнём группировку.\n"
+        "Введи ЛЕВУЮ часть (фиксированный список слов):"
     )
+    await update.message.reply_text(help_text)
     return LEFT
 
 
@@ -83,7 +94,7 @@ async def maxlen_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("min_len не может быть больше max_len. Введите max_len ещё раз:")
         return MAXLEN
     await update.message.reply_text(
-        "Теперь введи разделитель (например ')*(' или ')/1(' — обязательно прописываем скобочки):"
+        "Теперь введи разделитель (например ')*(' или ')/1(' — скобочки можно не писать):"
     )
     return SEPARATOR
 
@@ -97,7 +108,7 @@ async def separator_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = pack(ud["left"], ud["right"], ud["min_len"], ud["max_len"], separator)
         out_text = ", ".join(results)
 
-        if len(out_text) > 4000:
+        if len(out_text) > 4000:  # запас до 4096 лимита сообщения
             path = f"result_{update.effective_user.id}.txt"
             with open(path, "w", encoding="utf-8") as f:
                 f.write(out_text)
@@ -117,11 +128,10 @@ async def separator_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ======== ФОРМАТТЕР ТЕКСТА (/format) ========
+# ======== ФОРМАТТЕР (/format) ========
 
 async def format_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Старт форматтера: ждём .txt или просто текст."""
-    # не очищаем весь user_data, чтобы не мешать параллельным сессиям упаковщика
     context.user_data.pop("fmt_text", None)
     await update.message.reply_text(
         "Режим форматирования.\nПришлите .txt файл ИЛИ вставьте текст сообщением (через запятую):"
@@ -130,13 +140,11 @@ async def format_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def fmt_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимаем .txt или текст, сохраняем в user_data['fmt_text'] и спрашиваем N."""
+    """Принимаем .txt или текст, сохраняем и спрашиваем число N."""
     text: str | None = None
 
-    # Если прислали документ .txt
     if update.message.document and update.message.document.mime_type == "text/plain":
         doc = update.message.document
-        # Ограничение размера на всякий случай (например, 5 МБ)
         if doc.file_size and doc.file_size > 5 * 1024 * 1024:
             await update.message.reply_text("Файл слишком большой (>5 МБ). Пришлите меньший файл.")
             return FMT_TEXT
@@ -151,7 +159,6 @@ async def fmt_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-    # Если прислали просто текст
     elif update.message.text:
         text = update.message.text
 
@@ -177,7 +184,6 @@ async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result, total, phrases, singles = process_text(text, n)
 
-        # сохраняем во временный файл и отправляем
         out_path = Path(f"formatted_{update.effective_user.id}.txt")
         out_path.write_text(result, encoding="utf-8")
         try:
@@ -189,7 +195,6 @@ async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # статистика
         preview = result[:200]
         await update.message.reply_text(
             f"Готово ✅\nВсего элементов: {total}\nФраз: {phrases}\nОдиночных слов: {singles}\nПредпросмотр: {preview}"
@@ -199,12 +204,11 @@ async def fmt_n_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка при форматировании")
         await update.message.reply_text(f"Ошибка: {e}")
 
-    # завершаем диалог форматтера
     context.user_data.pop("fmt_text", None)
     return ConversationHandler.END
 
 
-# ======== Общие команды ========
+# ======== Сервисные и справка ========
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -218,8 +222,31 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LEFT
 
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "🧩 Справка:\n"
+        "• Группировка — /start\n"
+        "  1) ЛЕВАЯ часть → 2) ПРАВАЯ часть → 3) min_len → 4) max_len → 5) разделитель ('*(' и т.п.)\n"
+        "• Форматирование — /format\n"
+        "  — Пришлите .txt или текст через запятую, затем N. Фразы → \"...\"~N\n"
+        "• Сервисные: /reset — сброс и перезапуск, /cancel — отмена, /help — подсказка\n"
+    )
+    await update.message.reply_text(help_text)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception", exc_info=context.error)
+
+
+async def post_init(app: Application):
+    """Меню команд в Telegram-клиенте."""
+    await app.bot.set_my_commands([
+        BotCommand("start", "Группировка (упаковка токенов)"),
+        BotCommand("format", "Форматирование текста в \"...\"~N"),
+        BotCommand("reset", "Сброс диалога/перезапуск"),
+        BotCommand("cancel", "Отмена текущей операции"),
+        BotCommand("help", "Показать краткую справку"),
+    ])
 
 
 def build_app() -> Application:
@@ -227,7 +254,26 @@ def build_app() -> Application:
     if not token:
         raise RuntimeError("BOT_TOKEN is not set")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
+
+    # Диалог "форматтера"
+    conv_fmt = ConversationHandler(
+        entry_points=[CommandHandler("format", format_start)],
+        states={
+            FMT_TEXT: [
+                MessageHandler(filters.Document.FileExtension("txt"), fmt_text_input),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_text_input),
+            ],
+            FMT_N: [MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_n_input)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel),
+                   CommandHandler("reset", reset),
+                   CommandHandler("start", start)],
+        allow_reentry=True,
+        conversation_timeout=600,
+        name="conv_fmt",
+        persistent=False,
+    )
 
     # Диалог "упаковщика"
     conv_pack = ConversationHandler(
@@ -239,40 +285,17 @@ def build_app() -> Application:
             MAXLEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, maxlen_input)],
             SEPARATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, separator_input)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("reset", reset),
-            CommandHandler("start", start),
-        ],
+        fallbacks=[CommandHandler("cancel", cancel),
+                   CommandHandler("reset", reset),
+                   CommandHandler("start", start)],
         allow_reentry=True,
         conversation_timeout=600,
         name="conv_pack",
         persistent=False,
     )
 
-    # Диалог "форматтера"
-    conv_fmt = ConversationHandler(
-        entry_points=[CommandHandler("format", format_start)],
-        states={
-            FMT_TEXT: [
-                # принимаем .txt файл или обычный текст
-                MessageHandler(filters.Document.FileExtension("txt"), fmt_text_input),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_text_input),
-            ],
-            FMT_N: [MessageHandler(filters.TEXT & ~filters.COMMAND, fmt_n_input)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("reset", reset),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
-        conversation_timeout=600,
-        name="conv_fmt",
-        persistent=False,
-    )
-
     # Глобальные команды
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", start))
     app.add_handler(conv_fmt)
     app.add_handler(conv_pack)
@@ -283,6 +306,7 @@ def build_app() -> Application:
 
 def main():
     app = build_app()
+    # Webhook на Render (или любой PaaS) / Polling локально
     base = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
     port = int(os.getenv("PORT", "10000"))
     path = f"/webhook/{os.getenv('WEBHOOK_PATH', 'tg')}"
